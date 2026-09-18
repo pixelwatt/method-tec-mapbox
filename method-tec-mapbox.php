@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Method – Mapbox for The Events Calendar
  * Description: Opt-in replacement for The Events Calendar's Google Maps integration. Geocodes venues through Mapbox and keeps coordinates in sync between TEC/ECP meta and a cmb2-mapbox field.
- * Version: 1.0.0
+ * Version: 1.0.1
  * Author: Rob Clark
  * Author URI: https://robclark.io
  * License: GPLv2 or later
@@ -19,7 +19,20 @@
  *   add_filter( 'method_mapbox_venue_meta_key', fn() => '_venue_location' );
  *
  * Once enabled:
- *   - TEC / ECP Google Maps output and ECP's Google geocoder are disabled.
+ *   - TEC / ECP Google Maps scripts and ECP's Google geocoder are disabled.
+ *   - Wherever TEC would embed a Google map (tribe_get_embedded_map(): single
+ *     event meta, venue block, single venue) a Mapbox GL map is rendered from
+ *     the venue's stored coordinates instead. TEC's "Enable Maps" setting and
+ *     the per-event / per-venue "Show Map" checkboxes keep working. Venues
+ *     without coordinates render no map (see `wp method geocode-venues`).
+ *     Customise with:
+ *
+ *       add_filter( 'method_mapbox_embedded_map', function ( $config, $venue_id ) {
+ *           $config['options']['style'] = 'mapbox://styles/you/xxxx'; // any mapboxgl.Map option
+ *           $config['marker']['color']  = '#e86100';                  // any mapboxgl.Marker option
+ *           return $config;
+ *       }, 10, 2 );
+ *
  *   - Any venue create/update (venue editor, inline venue form in the event
  *     editor, venue block via REST, importer) is geocoded through Mapbox and
  *     written to ECP's keys (_VenueLat, _VenueLng, _VenueGeoAddress) AND to
@@ -56,11 +69,18 @@ final class Method_Mapbox_Venue_Sync {
 
 	const ENDPOINT = 'https://api.mapbox.com/search/geocode/v6/forward';
 
+	// Same handle and version cmb2-mapbox enqueues, so the library never loads twice.
+	const GL_HANDLE = 'mapbox-gl';
+	const GL_BASE   = 'https://api.mapbox.com/mapbox-gl-js/v3.23.1/mapbox-gl';
+
 	/** @var string */
 	private static $token = '';
 
 	/** @var string */
 	private static $meta_key = '';
+
+	/** @var array{venue_id: int, index: int, style: string} Set while TEC builds one embedded map. */
+	private static $pending_map = [ 'venue_id' => 0, 'index' => 0, 'style' => '' ];
 
 	public static function boot(): void {
 		// Late enough that TEC, ECP and the child theme have all registered.
@@ -76,10 +96,13 @@ final class Method_Mapbox_Venue_Sync {
 
 		self::$meta_key = (string) apply_filters( 'method_mapbox_venue_meta_key', '_venue_location' );
 
-		// 1. Take Google out of the picture.
-		add_filter( 'tribe_get_option_embedGoogleMaps', '__return_false' );
+		// 1. Take Google out of the picture. With no key TEC never enqueues its Google scripts,
+		//    but it still runs the embed routine, which we use to swap in a Mapbox map.
 		add_filter( 'tribe_get_option_google_maps_js_api_key', '__return_empty_string' );
-		add_filter( 'tribe_get_embedded_map', '__return_empty_string' );
+		add_filter( 'tribe_is_using_basic_gmaps_api', '__return_false' );
+		add_filter( 'tribe_events_embedded_map_style', [ __CLASS__, 'capture_map_style' ], 99, 2 );
+		add_action( 'tribe_events_map_embedded', [ __CLASS__, 'capture_map_venue' ], 10, 2 );
+		add_filter( 'tribe_get_embedded_map', [ __CLASS__, 'render_map' ], 99 );
 
 		if ( class_exists( 'Tribe__Events__Pro__Geo_Loc' ) ) {
 			$geo = Tribe__Events__Pro__Geo_Loc::instance();
@@ -207,6 +230,155 @@ final class Method_Mapbox_Venue_Sync {
 		// Pin the geocode cache to the current address so Direction A treats this
 		// pin as authoritative until the address itself changes.
 		update_post_meta( $venue_id, self::ADDRESS, self::build_address( $venue_id ) );
+	}
+
+	/* ---------------------------------------------------------------------
+	 * Front end: TEC's embedded Google map → Mapbox GL
+	 *
+	 * 'tribe_get_embedded_map' only receives the finished HTML, so the two
+	 * hooks TEC fires just before it are used to learn which venue (and what
+	 * dimensions) the map is for.
+	 * ------------------------------------------------------------------ */
+
+	/**
+	 * Fires from TEC's modules/map template with the "height: x; width: y" it was asked for.
+	 *
+	 * @param string $style
+	 * @param int    $index
+	 */
+	public static function capture_map_style( $style, $index = 0 ) {
+		self::$pending_map['style'] = (string) $style;
+		return $style;
+	}
+
+	/**
+	 * Fires from Tribe__Events__Embedded_Maps::get_map() immediately before 'tribe_get_embedded_map'.
+	 *
+	 * @param int $index
+	 * @param int $venue_id
+	 */
+	public static function capture_map_venue( $index, $venue_id ): void {
+		self::$pending_map['index']    = (int) $index;
+		self::$pending_map['venue_id'] = (int) $venue_id;
+	}
+
+	/**
+	 * Replace TEC's Google map container with a Mapbox one.
+	 *
+	 * @param string $html
+	 * @return string Empty when TEC bailed (no venue / no address) or the venue has no coordinates.
+	 */
+	public static function render_map( $html ): string {
+		$pending           = self::$pending_map;
+		self::$pending_map = [ 'venue_id' => 0, 'index' => 0, 'style' => '' ];
+
+		$venue_id = $pending['venue_id'];
+		$coords   = $venue_id ? self::get_coords( $venue_id ) : null;
+		if ( ! $coords ) {
+			return '';
+		}
+
+		/**
+		 * 'options' is passed to mapboxgl.Map, 'marker' to mapboxgl.Marker; 'title' is the
+		 * marker popup text (empty for no popup). Return an empty array to render no map.
+		 */
+		$config = apply_filters( 'method_mapbox_embedded_map', [
+			'options' => [
+				'style'               => 'mapbox://styles/mapbox/streets-v12',
+				'center'              => [ $coords['lng'], $coords['lat'] ],
+				'zoom'                => (int) apply_filters( 'tribe_events_single_map_zoom_level', (int) tribe_get_option( 'embedGoogleMapsZoom', 15 ) ),
+				'cooperativeGestures' => true,
+			],
+			'marker'  => [ 'color' => '#3FB1CE' ],
+			'title'   => html_entity_decode( get_the_title( $venue_id ), ENT_QUOTES, 'UTF-8' ),
+		], $venue_id );
+
+		if ( empty( $config['options']['center'] ) ) {
+			return '';
+		}
+
+		self::enqueue_map_assets();
+
+		return sprintf(
+			'<div id="method-tec-mapbox-map-%1$d" class="method-tec-mapbox-map" style="%2$s" role="region" aria-label="%3$s" data-map="%4$s"></div>',
+			$pending['index'],
+			esc_attr( $pending['style'] ?: 'height: 350px; width: 100%' ),
+			/* translators: %s: venue name */
+			esc_attr( sprintf( __( 'Map of %s', 'method-tec-mapbox' ), wp_strip_all_tags( get_the_title( $venue_id ) ) ) ),
+			esc_attr( wp_json_encode( $config ) )
+		);
+	}
+
+	/**
+	 * Coordinates for a venue: TEC's keys first, then the cmb2-mapbox pin.
+	 *
+	 * @return array{lat: float, lng: float}|null
+	 */
+	private static function get_coords( int $venue_id ): ?array {
+		$lat = get_post_meta( $venue_id, self::LAT, true );
+		$lng = get_post_meta( $venue_id, self::LNG, true );
+
+		if ( ! is_numeric( $lat ) || ! is_numeric( $lng ) ) {
+			$pin = get_post_meta( $venue_id, self::$meta_key, true );
+			$lat = is_array( $pin ) ? ( $pin['lat'] ?? null ) : null;
+			$lng = is_array( $pin ) ? ( $pin['lng'] ?? null ) : null;
+		}
+
+		if ( ! is_numeric( $lat ) || ! is_numeric( $lng ) ) {
+			return null;
+		}
+
+		return [ 'lat' => (float) $lat, 'lng' => (float) $lng ];
+	}
+
+	private static function enqueue_map_assets(): void {
+		if ( ! wp_script_is( self::GL_HANDLE, 'registered' ) ) {
+			wp_register_script( self::GL_HANDLE, self::GL_BASE . '.js', [], null, true );
+		}
+		if ( ! wp_style_is( self::GL_HANDLE, 'registered' ) ) {
+			wp_register_style( self::GL_HANDLE, self::GL_BASE . '.css', [], null );
+		}
+		wp_enqueue_script( self::GL_HANDLE );
+		wp_enqueue_style( self::GL_HANDLE );
+
+		// After wp_print_footer_scripts (20), so mapboxgl exists whether it loaded in the head or the footer.
+		if ( ! has_action( 'wp_footer', [ __CLASS__, 'print_map_script' ] ) ) {
+			add_action( 'wp_footer', [ __CLASS__, 'print_map_script' ], 100 );
+		}
+	}
+
+	public static function print_map_script(): void {
+		$token = wp_json_encode( self::$token );
+
+		$js = <<<JS
+		( function () {
+			if ( 'undefined' === typeof mapboxgl ) {
+				return;
+			}
+			mapboxgl.accessToken = {$token};
+
+			document.querySelectorAll( '.method-tec-mapbox-map' ).forEach( function ( el ) {
+				var config;
+				try {
+					config = JSON.parse( el.getAttribute( 'data-map' ) );
+				} catch ( e ) {
+					return;
+				}
+
+				var map    = new mapboxgl.Map( Object.assign( {}, config.options, { container: el } ) );
+				var marker = new mapboxgl.Marker( config.marker || {} ).setLngLat( config.options.center );
+
+				if ( config.title ) {
+					marker.setPopup( new mapboxgl.Popup( { offset: 25 } ).setText( config.title ) );
+				}
+
+				marker.addTo( map );
+				map.addControl( new mapboxgl.NavigationControl(), 'top-left' );
+			} );
+		} )();
+		JS;
+
+		wp_print_inline_script_tag( $js, [ 'id' => 'method-tec-mapbox-js' ] );
 	}
 
 	/* ---------------------------------------------------------------------
