@@ -8,6 +8,7 @@
  * License: GPLv2 or later
  * Text Domain: method-tec-mapbox
  * GitHub Plugin URI: https://github.com/pixelwatt/method-tec-mapbox
+ * Primary Branch: main
  *
  * Nothing runs until a child theme (or mu-plugin) supplies a token:
  *
