@@ -1,0 +1,106 @@
+# CHANGELOG
+
+## v1.0.2
+
+### Changed — Opting In No Longer Requires a Token
+
+Hooking `method_mapbox_token` is now what opts a site in, whether or not the callback has a token to return. Previously the plugin did nothing until the filter returned a non-empty token, so a site that had hooked the filter but not yet entered a token kept showing The Events Calendar's Google maps.
+
+- **Opted in, no token** — TEC's Google Maps scripts and embedded maps are disabled and no map is output in their place: `tribe_get_option_google_maps_js_api_key` returns an empty string, `tribe_is_using_basic_gmaps_api` returns `false`, and `tribe_get_embedded_map` returns an empty string. Geocoding, pin sync, the ECP geocoder replacement, and the `wp method geocode-venues` command are not registered until a token is available.
+- **Opted in, token present** — unchanged: Mapbox maps replace TEC's embeds.
+- **Not opted in** — unchanged: with nothing hooked to `method_mapbox_token` the plugin does nothing, and TEC's own maps are left alone.
+- **Not affected** — the per-event and per-venue **Show Map** and **Show Map Link** checkboxes are never modified, and the "+ Google Map" link controlled by **Show Map Link** is not filtered.
+
+### Stale Coordinates — Unset When an Address Can't Be Geocoded
+
+Previously, when a venue's address changed and the new address could not be geocoded, the coordinates found for the old address were left in place and the map kept showing the previous location.
+
+- **Unset on failure** — when a lookup returns no match, returns a match below `method_mapbox_min_confidence`, or the request fails, `_VenueLat`, `_VenueLng`, `_VenueGeoAddress`, and the cmb2-mapbox pin are deleted. The same happens when a venue's address is removed entirely. A venue without coordinates renders no map, and its next save tries geocoding again.
+- **Kept when placed by hand** — coordinates are left alone when the venue has a manual pin (below), when ECP's `_VenueOverwriteCoords` is set, or when the cmb2-mapbox pin holds coordinates that TEC's keys don't mirror (a pin saved before this plugin was active).
+- **Kept when still correct** — a failed lookup of the same address the coordinates were cached for, such as a request error during `wp method geocode-venues --force`, does not unset them.
+- **`method_venue_geocode_failed`** — still fires on every failed lookup, now after any stale coordinates have been unset.
+
+### Manual Pins — Tracked and Protected
+
+- **New `_VenueManualPin` meta** — set on a venue when its pin is dropped or moved by hand in the cmb2-mapbox field. It is removed when the pin is deleted, and when the plugin writes coordinates itself (a successful geocode, or ECP's manual coordinates).
+- **Same-save precedence** — a pin dropped in the same save as an address change takes precedence over the geocoder, whether or not the new address can be geocoded, and the geocode cache is pinned to the new address.
+- **Address changes** — changing the address of a venue with a manual pin re-geocodes it, and a successful result replaces the pin. This is the behaviour documented since 1.0.1, but with the pin field on the venue edit screen it did not take effect: the form's pin always won (see the fix below).
+- **Deleting a pin** — as before, clears the venue's coordinates so that the venue is geocoded again.
+
+### Fixed — Geocoded Coordinates Lost With the Pin Field on the Venue Edit Screen
+
+With a cmb2-mapbox field on the venue edit screen, CMB2 saves the form's copy of the pin after the geocoder has run. In 1.0.1 that copy was always treated as a pin change:
+
+- A new venue, or one without a pin, had its freshly geocoded coordinates cleared, because the form's empty pin was read as a deletion.
+- A venue whose address changed kept its old coordinates, because the form's old pin overwrote the new result.
+
+The pin sync now compares the saved pin with the pin as the request found it, and with TEC's coordinates, and only treats it as a change when the pin was actually moved. A pin re-saved at the same coordinates (within 0.0000001°) is ignored.
+
+Both save orders are handled. TEC normally saves a venue's meta before CMB2 runs, but when it is given a venue title it runs a nested post update first, which lets CMB2 save before the geocoder as well as after.
+
+### Upgrade Notes
+
+- **Pins dropped before 1.0.2 are not flagged.** They were mirrored into TEC's keys without `_VenueManualPin`, so they are treated as geocoded coordinates and will be unset if the venue's address later fails to geocode. To protect one, move the pin and save, or set the flag directly with `wp post meta update <venue-id> _VenueManualPin 1`.
+- **Existing stale coordinates** are only corrected when a venue is next saved. `wp method geocode-venues` re-checks every venue whose address differs from the one its coordinates were cached for, and unsets the coordinates of those that can't be geocoded.
+- **Sites that hook `method_mapbox_token` without a token** stop showing Google maps as soon as they update.
+
+### Internal
+
+- `get_coords()` now composes the new `get_tec_coords()`, `get_pin()`, and `as_point()` helpers; `same_point()` compares two points.
+- `write_coords()` hands the cmb2-mapbox write to a new `write_pin()`, so the pin can be restored without touching TEC's keys.
+- New `clear_stale_coords()`, `is_pinned()`, and `remember_pin()` helpers, and two per-request properties (`$pin_before`, `$pin_moved`) that carry pin state between the TEC and CMB2 save hooks.
+- Plugin header documentation updated to describe the opt-in and stale-coordinate behaviour.
+- Version bumped to 1.0.2.
+
+---
+
+## v1.0.1
+
+### Embedded Maps — Mapbox GL in Place of TEC's Google Maps
+
+1.0.0 removed The Events Calendar's embedded maps without putting anything in their place. Wherever TEC would embed a Google map through `tribe_get_embedded_map()` (single event meta, venue block, single venue), a Mapbox GL map is now rendered from the venue's stored coordinates.
+
+- **Rendering** — new `render_map()` on `tribe_get_embedded_map` (priority 99) replaces TEC's markup with a `<div class="method-tec-mapbox-map">` that carries the map configuration as JSON in `data-map`, plus `role="region"` and a "Map of {venue}" `aria-label`. That filter only receives finished HTML, so the venue and the requested dimensions are captured from `tribe_events_map_embedded` and `tribe_events_embedded_map_style` just before it runs. Without captured dimensions the map is `height: 350px; width: 100%`.
+- **Coordinates** — read from TEC's `_VenueLat` / `_VenueLng` first, then from the cmb2-mapbox pin. A venue without coordinates renders no map.
+- **Defaults** — the `mapbox://styles/mapbox/streets-v12` style, the zoom level from TEC's map zoom setting (`embedGoogleMapsZoom`, 15 when unset, passed through `tribe_events_single_map_zoom_level`), `cooperativeGestures` enabled, a `#3FB1CE` marker whose popup shows the venue title, and a navigation control in the top-left corner.
+- **New `method_mapbox_embedded_map` filter** — receives `( $config, $venue_id )`. `options` is passed to `mapboxgl.Map`, `marker` to `mapboxgl.Marker`, and `title` is the popup text (empty for no popup). Returning an empty array renders no map.
+- **Assets** — Mapbox GL JS 3.23.1 is registered under the `mapbox-gl` handle, the same handle and version cmb2-mapbox enqueues, so the library never loads twice. One inline script (`method-tec-mapbox-js`), printed in `wp_footer` at priority 100, initialises every map on the page.
+
+### Changed — Enable Maps No Longer Forced Off
+
+- **Show Map works again** — 1.0.0 forced TEC's **Enable Maps** setting off through `tribe_get_option_embedGoogleMaps`. That hid the **Show Map** checkbox in the classic event and venue editors, so every save stored it unchecked. The override is removed: **Enable Maps** and the per-event and per-venue **Show Map** checkboxes behave as TEC intends.
+- **Google scripts still excluded** — the Google Maps API key is still blanked through `tribe_get_option_google_maps_js_api_key`, and `tribe_is_using_basic_gmaps_api` now returns `false`. TEC runs its embed routine, which the plugin needs in order to swap in its own map, but never enqueues Google's scripts.
+
+### Upgrade Notes
+
+- **Events and venues saved while 1.0.0 was active** have **Show Map** stored unchecked. Updating does not restore it; re-check it on each one.
+- **Venues without coordinates** render no map. `wp method geocode-venues` geocodes every venue that has an address but no coordinates.
+
+### Housekeeping
+
+- `Primary Branch: main` header added for Git Updater.
+- Plugin header documentation updated to cover the embedded map and its filter.
+- Version bumped to 1.0.1.
+
+---
+
+## v1.0.0
+
+### Initial Release
+
+An opt-in replacement for The Events Calendar's Google Maps integration. Venues are geocoded through Mapbox, and their coordinates are kept in sync between TEC / ECP meta and a cmb2-mapbox field. Requires The Events Calendar, and cmb2-mapbox for the pin field and optional token reuse.
+
+- **Opt-in** — nothing runs until `method_mapbox_token` returns a token; the check happens on `init` at priority 100, after TEC, ECP, and the child theme have registered. The `method_cmb2_mapbox_token()` helper returns the token cmb2-mapbox already stores, honouring `cmb2_mapbox_use_method`. `method_mapbox_venue_meta_key` names the cmb2-mapbox field registered on venues (default `_venue_location`).
+- **Google removed** — TEC's **Enable Maps** setting is forced off, the Google Maps API key is blanked, and `tribe_get_embedded_map` returns an empty string. ECP's geocoder (`Tribe__Events__Pro__Geo_Loc::save_venue_geodata`) is unhooked from `tribe_events_venue_created` and `tribe_events_venue_updated`.
+- **Venue save → coordinates** — on those two actions (priority 20) the venue's address is geocoded and written to `_VenueLat`, `_VenueLng`, and `_VenueGeoAddress`, and to the cmb2-mapbox key as `lat`, `lng`, and `lnglat`. This covers the venue editor, the inline venue form in the event editor, the venue block via REST, and the importer. A venue is skipped when it already has coordinates for an unchanged address, or when ECP's `_VenueOverwriteCoords` is set.
+- **ECP manual coordinates** — ECP's `OverwriteCoords`, `Lat`, and `Lng` fields are handled in place of the unhooked ECP handler.
+- **Pin save → coordinates** — on `cmb2_save_field`, a pin saved in the cmb2-mapbox field is written to `_VenueLat` / `_VenueLng`, and the geocode cache is pinned to the current address so the next venue save leaves the pin alone unless the address changes. Deleting the pin clears the coordinates so that the venue is geocoded again.
+- **Geocoding** — Mapbox Geocoding v6 forward lookups with `limit` 1, `types` `address,street,place`, and an 8 second timeout. Results below the minimum confidence (`medium` by default) are rejected.
+- **Filters** — `method_venue_geocode_address` `( $address, $venue_id, $data )`, `method_mapbox_geocode_args` `( $args, $venue_id, $address )`, and `method_mapbox_min_confidence`.
+- **Actions** — `method_venue_geocoded` `( $venue_id, $result, $address )` and `method_venue_geocode_failed` `( $venue_id, $address )`.
+- **WP-CLI** — `wp method geocode-venues [--force]` geocodes every venue; `--force` ignores the address cache and the overwrite flag.
+- **Git Updater** — `GitHub Plugin URI` header.
+
+### Known Issue
+
+- With the cmb2-mapbox field on the venue edit screen, geocoded coordinates do not persist, because the form's copy of the pin is saved over them. Present in 1.0.0 and 1.0.1; fixed in v1.0.2.
